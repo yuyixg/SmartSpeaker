@@ -7,6 +7,7 @@ using Microsoft.CognitiveServices.Speech;
 using Microsoft.CognitiveServices.Speech.Audio;
 using SmartSpeaker.Core.Config;
 using SmartSpeaker.Core.Interfaces;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace SmartSpeaker.Core.Services
 {
@@ -108,9 +109,9 @@ namespace SmartSpeaker.Core.Services
         /// <returns>异步任务</returns>
         public async Task PlayAudioFileAsync(string filePath)
         {
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath) || _speechConfig == null)
+            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
             {
-                _logger.LogWarning($"音频文件不存在或语音配置未初始化: {filePath}");
+                _logger.LogWarning($"音频文件不存在: {filePath}");
                 return;
             }
 
@@ -119,23 +120,7 @@ namespace SmartSpeaker.Core.Services
                 _logger.LogDebug($"开始播放音频文件: {filePath}");
                 _isPlaying = true;
 
-                // 使用AudioConfig从文件创建音频输入
-                using (var audioConfig = AudioConfig.FromWavFileInput(filePath))
-                {
-                    // 创建临时合成器用于播放文件
-                    using (var player = new SpeechSynthesizer(_speechConfig, audioConfig))
-                    {
-                        // 直接播放一个空的SSML，这样可以触发音频文件的播放
-                        var ssml = $@"<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='{_config.SynthesisLanguage}'><voice name='{_config.VoiceName}'></voice></speak>";
-                        var result = await player.SpeakSsmlAsync(ssml);
-
-                        // 检查结果
-                        if (result.Reason != ResultReason.SynthesizingAudioCompleted)
-                        {
-                            _logger.LogError($"播放音频文件失败: {result.Reason}");
-                        }
-                    }
-                }
+               await SpeakTextAsync("我在，你说");
 
                 _isPlaying = false;
                 OnPlaybackCompleted?.Invoke();
@@ -215,4 +200,4 @@ namespace SmartSpeaker.Core.Services
             _logger.LogDebug("AzureSpeechPlayer资源已释放");
         }
     }
-} 
+}
