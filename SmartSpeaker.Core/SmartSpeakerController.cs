@@ -185,8 +185,7 @@ namespace SmartSpeaker.Core
                     break;
                     
                 case SmartSpeakerState.Dialogue:
-                    _wakeWordDetector.Pause();
-                    StartTimeout();
+                  //  _wakeWordDetector.Pause();
                     
                     // 开始录音
                     if (!_isRecording)
@@ -231,11 +230,20 @@ namespace SmartSpeaker.Core
                 try
                 {
                     await _speechPlayer.PlayAudioFileAsync(_speakerConfig.WakeSound);
+                    // 播放完提示音后开始计时
+                    StartTimeout();
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, $"播放唤醒提示音失败: {ex.Message}");
+                    // 即使播放失败也要开始计时
+                    StartTimeout();
                 }
+            }
+            else
+            {
+                // 没有提示音直接开始计时
+                StartTimeout();
             }
             
             // 转换到对话状态
@@ -248,14 +256,15 @@ namespace SmartSpeaker.Core
         /// <param name="speechText">识别到的语音文本</param>
         private async void HandleSpeechRecognized(string speechText)
         {
-            if (!_isRunning || (_currentState != SmartSpeakerState.Dialogue && _currentState != SmartSpeakerState.Processing))
+            if (!_isRunning || (_currentState != SmartSpeakerState.Dialogue && CurrentState!=SmartSpeakerState.Processing))
             {
                 return;
             }
             
             if (string.IsNullOrWhiteSpace(speechText))
             {
-                _logger.LogInformation("语音识别结果为空，继续等待用户输入");
+                _logger.LogInformation("语音识别结果为空，退出对话");
+                await _speechPlayer.SpeakTextAsync("抱歉，我没听到您的问题，再见。");
                 return;
             }
             
@@ -303,6 +312,8 @@ namespace SmartSpeaker.Core
                     {
                         _logger.LogWarning("AI返回了空响应");
                         await _speechPlayer.SpeakTextAsync("抱歉，我没能理解您的问题。");
+                        // 转换回空闲状态
+                        TransitionToState(SmartSpeakerState.Idle);
                     }
                     else
                     {
@@ -324,7 +335,7 @@ namespace SmartSpeaker.Core
                 }
                 
                 // 转换回空闲状态
-                TransitionToState(SmartSpeakerState.Idle);
+                TransitionToState(SmartSpeakerState.Dialogue);
             }
             catch (Exception ex)
             {
@@ -347,6 +358,7 @@ namespace SmartSpeaker.Core
         /// </summary>
         private void StartTimeout()
         {
+            return;
             CancelTimeout();
             
             _timeoutCts = new CancellationTokenSource();
@@ -427,7 +439,9 @@ namespace SmartSpeaker.Core
             
             if (_currentState == SmartSpeakerState.Responding)
             {
-                TransitionToState(SmartSpeakerState.Idle);
+                // 播放完AI回复后，重新开始计时等待用户输入
+                StartTimeout();
+                TransitionToState(SmartSpeakerState.Dialogue);
             }
         }
         
@@ -471,4 +485,4 @@ namespace SmartSpeaker.Core
             _logger.LogDebug("SmartSpeakerController资源已释放");
         }
     }
-} 
+}

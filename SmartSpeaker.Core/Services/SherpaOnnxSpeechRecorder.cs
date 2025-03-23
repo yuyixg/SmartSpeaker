@@ -26,8 +26,11 @@ namespace SmartSpeaker.Core.Services
         private CancellationTokenSource? _cts;
         private TaskCompletionSource<bool>? _recordingTaskSource;
         private DateTime _lastSpeechTime;
+        private string _lastText = string.Empty;
         private bool _isRecording;
         private string _currentText = string.Empty;
+        private bool _hasVoiceActivity;
+        private const float _energyThreshold = 0.01f;
 
         /// <summary>
         /// 语音识别事件
@@ -65,6 +68,7 @@ namespace SmartSpeaker.Core.Services
             try
             {
                 InitializeRecognizer();
+                InitializeAudioCapture();
                 _logger.LogDebug("sherpa-onnx语音录制器已初始化");
             }
             catch (Exception ex)
@@ -80,21 +84,21 @@ namespace SmartSpeaker.Core.Services
         private void InitializeRecognizer()
         {
             var config = new OnlineRecognizerConfig();
-            
+
             // 设置特征配置
             config.FeatConfig.SampleRate = _config.SampleRate;
             config.FeatConfig.FeatureDim = _config.FeatureDim;
 
             // 设置模型路径
             var modelDir = System.IO.Path.GetFullPath(_config.ModelDir);
-            
+
             _logger.LogInformation($"使用模型目录: {modelDir}");
-            
+
             if (!System.IO.Directory.Exists(modelDir))
             {
                 throw new System.IO.DirectoryNotFoundException($"模型目录不存在: {modelDir}");
             }
-            
+
             // 设置转录器模型（如果使用）
             if (!string.IsNullOrEmpty(_config.EncoderModel) &&
                 !string.IsNullOrEmpty(_config.DecoderModel) &&
@@ -103,26 +107,26 @@ namespace SmartSpeaker.Core.Services
                 var encoderPath = System.IO.Path.Combine(modelDir, _config.EncoderModel);
                 var decoderPath = System.IO.Path.Combine(modelDir, _config.DecoderModel);
                 var joinerPath = System.IO.Path.Combine(modelDir, _config.JoinerModel);
-                
+
                 if (!System.IO.File.Exists(encoderPath))
                 {
                     throw new System.IO.FileNotFoundException($"编码器模型文件不存在: {encoderPath}");
                 }
-                
+
                 if (!System.IO.File.Exists(decoderPath))
                 {
                     throw new System.IO.FileNotFoundException($"解码器模型文件不存在: {decoderPath}");
                 }
-                
+
                 if (!System.IO.File.Exists(joinerPath))
                 {
                     throw new System.IO.FileNotFoundException($"连接器模型文件不存在: {joinerPath}");
                 }
-                
+
                 config.ModelConfig.Transducer.Encoder = encoderPath;
                 config.ModelConfig.Transducer.Decoder = decoderPath;
                 config.ModelConfig.Transducer.Joiner = joinerPath;
-                
+
                 _logger.LogInformation($"使用转录器模型: Encoder={encoderPath}, Decoder={decoderPath}, Joiner={joinerPath}");
             }
 
@@ -132,20 +136,20 @@ namespace SmartSpeaker.Core.Services
             {
                 var encoderPath = System.IO.Path.Combine(modelDir, _config.ParaformerEncoder);
                 var decoderPath = System.IO.Path.Combine(modelDir, _config.ParaformerDecoder);
-                
+
                 if (!System.IO.File.Exists(encoderPath))
                 {
                     throw new System.IO.FileNotFoundException($"Paraformer编码器模型文件不存在: {encoderPath}");
                 }
-                
+
                 if (!System.IO.File.Exists(decoderPath))
                 {
                     throw new System.IO.FileNotFoundException($"Paraformer解码器模型文件不存在: {decoderPath}");
                 }
-                
+
                 config.ModelConfig.Paraformer.Encoder = encoderPath;
                 config.ModelConfig.Paraformer.Decoder = decoderPath;
-                
+
                 _logger.LogInformation($"使用Paraformer模型: Encoder={encoderPath}, Decoder={decoderPath}");
             }
 
@@ -155,16 +159,16 @@ namespace SmartSpeaker.Core.Services
             {
                 throw new System.IO.FileNotFoundException($"词表文件不存在: {tokensPath}");
             }
-            
+
             config.ModelConfig.Tokens = tokensPath;
             _logger.LogInformation($"使用词表文件: {tokensPath}");
-            
+
             // 设置其他配置
             config.ModelConfig.Provider = _config.Provider;
             config.ModelConfig.NumThreads = _config.NumThreads;
             config.DecodingMethod = _config.DecodingMethod;
             config.MaxActivePaths = _config.MaxActivePaths;
-            
+
             // 设置端点检测
             config.EnableEndpoint = 1;
             config.Rule1MinTrailingSilence = _config.Rule1MinTrailingSilence;
@@ -221,50 +225,69 @@ namespace SmartSpeaker.Core.Services
                     StreamCallbackFlags statusFlags,
                     IntPtr userData) =>
                 {
-                    if (_recognizerStream != null && input != IntPtr.Zero)
+                    if (_recognizerStream == null || _recognizer == null || input == IntPtr.Zero)
                     {
-                        try
+                        return StreamCallbackResult.Continue;
+                    }
+
+                    if (!_isRecording)
+                    {
+                        return StreamCallbackResult.Continue;
+                    }
+
+
+                    try
+                    {
+                        // 确保帧数不超过预期，并处理可能的溢出
+                        int safeFrameCount = (int)Math.Min(frameCount, 4096); // 限制最大帧数
+
+                        if (safeFrameCount <= 0)
                         {
-                            // 确保帧数不超过预期，并处理可能的溢出
-                            int safeFrameCount = (int)Math.Min(frameCount, 4096); // 限制最大帧数
-                            
-                            if (safeFrameCount <= 0)
-                            {
-                                return StreamCallbackResult.Continue;
-                            }
-
-                            // 从输入缓冲区读取音频数据
-                            float[] samples = new float[safeFrameCount];
-                            Marshal.Copy(input, samples, 0, safeFrameCount);
-
-                            // 将音频数据传递给识别器
-                            _recognizerStream.AcceptWaveform(_config.SampleRate, samples);
-
-                            // 检查是否有结果可以解码
-                            while (_recognizer.IsReady(_recognizerStream))
-                            {
-                                _recognizer.Decode(_recognizerStream);
-                                var result = _recognizer.GetResult(_recognizerStream);
-                                
-                                if (!string.IsNullOrEmpty(result.Text))
-                                {
-                                    _currentText = result.Text;
-                                    OnSpeechRecognized?.Invoke(_currentText);
-                                }
-                            }
+                            return StreamCallbackResult.Continue;
                         }
-                        catch (Exception ex)
+
+                        // 从输入缓冲区读取音频数据
+                        float[] samples = new float[safeFrameCount];
+                        Marshal.Copy(input, samples, 0, safeFrameCount);
+
+                        // 检测音频能量
+                        float energy = 0;
+                        for (int i = 0; i < samples.Length; i++)
                         {
-                            _logger.LogError(ex, $"处理音频数据时发生错误: {ex.Message}");
+                            energy += samples[i] * samples[i];
+                        }
+                        energy /= samples.Length;
+                        _hasVoiceActivity = energy > _energyThreshold;
+
+                        // 将音频数据传递给识别器
+                        _recognizerStream.AcceptWaveform(_config.SampleRate, samples);
+
+                        // 检查是否有结果可以解码
+                        while (_recognizer.IsReady(_recognizerStream))
+                        {
+                            _recognizer.Decode(_recognizerStream);
+                            var result = _recognizer.GetResult(_recognizerStream);
+
+                            if (!string.IsNullOrEmpty(result.Text))
+                            {
+                                _currentText = result.Text;
+                          
+
+                            }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"处理音频数据时发生错误: {ex.Message}");
+                    }
+
 
                     return StreamCallbackResult.Continue;
                 };
 
                 // 创建音频流
                 _audioStream = new Stream(param, null, _config.SampleRate, 1024, StreamFlags.NoFlag, callback, IntPtr.Zero);
-                _audioStream.Start();
+
                 _logger.LogDebug("音频捕获已初始化");
             }
             catch (Exception ex)
@@ -296,7 +319,7 @@ namespace SmartSpeaker.Core.Services
                 _currentText = string.Empty;
 
                 // 初始化音频捕获
-                InitializeAudioCapture();
+                _audioStream.Start();
 
                 // 启动静音检测
                 StartSilenceDetection();
@@ -324,18 +347,22 @@ namespace SmartSpeaker.Core.Services
                 {
                     while (!_cts?.Token.IsCancellationRequested ?? false)
                     {
-                        if (string.IsNullOrEmpty(_currentText))
+                        if (_currentText == _lastText)
                         {
                             var silenceDuration = DateTime.Now - _lastSpeechTime;
                             if (silenceDuration >= _silenceTimeout)
                             {
                                 _logger.LogInformation("检测到静音超时，停止录音");
                                 StopRecording();
+                                OnSpeechRecognized?.Invoke(_lastText);
+                                _lastText = string.Empty;
+                                _currentText=string.Empty;
                                 break;
                             }
                         }
                         else
                         {
+                            _lastText = _currentText;
                             _lastSpeechTime = DateTime.Now;
                         }
 
@@ -398,6 +425,8 @@ namespace SmartSpeaker.Core.Services
                     try
                     {
                         _audioStream.Stop();
+                       // _audioStream.Dispose();
+                       // _audioStream = null;
                     }
                     catch (Exception ex)
                     {
@@ -405,15 +434,25 @@ namespace SmartSpeaker.Core.Services
                     }
                 }
 
-                // 释放sherpa-onnx资源
-                _recognizerStream?.Dispose();
-                _recognizer?.Dispose();
-                
+                // 释放取消标记源
                 if (_cts != null)
                 {
                     _cts.Dispose();
                     _cts = null;
                 }
+
+                // 释放sherpa-onnx资源
+                //if (_recognizerStream != null)
+                //{
+                //    _recognizerStream.Dispose();
+                //    _recognizerStream = null;
+                //}
+
+                //if (_recognizer != null)
+                //{
+                //    _recognizer.Dispose();
+                //    _recognizer = null;
+                //}
             }
             catch (Exception ex)
             {
@@ -438,4 +477,4 @@ namespace SmartSpeaker.Core.Services
             _logger.LogDebug("SherpaOnnxSpeechRecorder资源已释放");
         }
     }
-} 
+}
