@@ -224,16 +224,35 @@ namespace SmartSpeaker.Core.Services
                     StreamCallbackFlags statusFlags,
                     IntPtr userData) =>
                 {
-                    if (_recognizerStream == null || _recognizer == null || input == IntPtr.Zero)
+                    // 增强安全检查，确保输入有效且录音状态正确
+                    if (!_isRecording || input == IntPtr.Zero)
                     {
                         return StreamCallbackResult.Continue;
                     }
 
-                    if (!_isRecording)
+                    // 创建本地引用，避免在处理过程中资源被释放
+                    OnlineStream? localStream = null;
+                    OnlineRecognizer? localRecognizer = null;
+                    
+                    // 使用锁确保不会在资源释放过程中访问它们
+                    lock (_recordingLock)
+                    {
+                        // 在锁内再次检查资源是否有效
+                        if (_recognizerStream == null || _recognizer == null || !_isRecording)
+                        {
+                            return StreamCallbackResult.Continue;
+                        }
+                        
+                        // 在锁内获取本地引用
+                        localStream = _recognizerStream;
+                        localRecognizer = _recognizer;
+                    }
+
+                    // 再次确认本地引用有效
+                    if (localStream == null || localRecognizer == null)
                     {
                         return StreamCallbackResult.Continue;
                     }
-
 
                     try
                     {
@@ -258,14 +277,20 @@ namespace SmartSpeaker.Core.Services
                         energy /= samples.Length;
                         _hasVoiceActivity = energy > _energyThreshold;
 
-                        // 将音频数据传递给识别器
-                        _recognizerStream.AcceptWaveform(_config.SampleRate, samples);
+                        // 再次检查录音状态，避免在处理过程中状态改变
+                        if (!_isRecording)
+                        {
+                            return StreamCallbackResult.Continue;
+                        }
+
+                        // 将音频数据传递给识别器，使用本地引用
+                        localStream.AcceptWaveform(_config.SampleRate, samples);
 
                         // 检查是否有结果可以解码
-                        while (_recognizer.IsReady(_recognizerStream))
+                        while (localRecognizer.IsReady(localStream))
                         {
-                            _recognizer.Decode(_recognizerStream);
-                            var result = _recognizer.GetResult(_recognizerStream);
+                            localRecognizer.Decode(localStream);
+                            var result = localRecognizer.GetResult(localStream);
 
                             if (!string.IsNullOrEmpty(result.Text))
                             {
@@ -300,41 +325,62 @@ namespace SmartSpeaker.Core.Services
         /// <summary>
         /// 开始录音
         /// </summary>
+        private readonly object _recordingLock = new object();
         public void StartRecording()
         {
-            if (_isRecording)
+            // 使用锁防止并发调用
+            lock (_recordingLock)
             {
-                _logger.LogWarning("语音录制已经在进行中");
-                return;
-            }
+                if (_isRecording)
+                {
+                    _logger.LogWarning("语音录制已经在进行中");
+                    return;
+                }
 
-            try
-            {
-                _logger.LogInformation("开始sherpa-onnx语音录制");
+                try
+                {
+                    _logger.LogInformation("开始sherpa-onnx语音录制");
 
-                // 创建取消标记源
-                _cts = new CancellationTokenSource();
-                _recordingTaskSource = new TaskCompletionSource<bool>();
-                _lastSpeechTime = DateTime.Now;
-                _lastText = string.Empty;
-                _currentText = string.Empty;
+                    // 创建取消标记源
+                    _cts = new CancellationTokenSource();
+                    _recordingTaskSource = new TaskCompletionSource<bool>();
+                    _lastSpeechTime = DateTime.Now;
+                    _lastText = string.Empty;
+                    _currentText = string.Empty;
 
-                // 初始化音频捕获
-                _recognizerStream = _recognizer.CreateStream();
-                InitializeAudioCapture();
+                    // 设置录音状态为true，防止回调函数中的竞态条件
+                    _isRecording = true;
 
-                // 启动静音检测
-                StartSilenceDetection();
+                    // 确保之前的流已经被释放
+                    if (_recognizerStream != null)
+                    {
+                        try
+                        {
+                            _recognizerStream.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"释放旧识别器流时发生错误: {ex.Message}");
+                        }
+                    }
 
-                _isRecording = true;
-                OnRecordingStarted?.Invoke();
+                    // 初始化音频捕获
+                    _recognizerStream = _recognizer.CreateStream();
+                    InitializeAudioCapture();
 
-                _logger.LogInformation("sherpa-onnx语音录制已开始");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"开始sherpa-onnx语音录制时发生错误: {ex.Message}");
-                Cleanup();
+                    // 启动静音检测
+                    StartSilenceDetection();
+
+                    OnRecordingStarted?.Invoke();
+
+                    _logger.LogInformation("sherpa-onnx语音录制已开始");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"开始sherpa-onnx语音录制时发生错误: {ex.Message}");
+                    _isRecording = false; // 确保在出错时重置状态
+                    Cleanup();
+                }
             }
         }
 
@@ -392,58 +438,79 @@ namespace SmartSpeaker.Core.Services
         /// </summary>
         public void StopRecording()
         {
-            if (!_isRecording)
+            // 使用锁防止并发访问
+            lock (_recordingLock)
             {
-                _logger.LogWarning("语音录制已经处于停止状态");
-                return;
-            }
-
-            try
-            {
-                _logger.LogInformation("停止sherpa-onnx语音录制");
-
-                // 先设置录音状态为false，确保回调函数不再处理新的音频数据
-                _isRecording = false;
-
-                // 取消正在进行的任务
-                _cts?.Cancel();
-
-                // 重置识别器流，确保停止处理之前的音频数据
-                if (_recognizer != null && _recognizerStream != null)
+                if (!_isRecording)
                 {
-                    try
-                    {
-                        // 释放旧的识别器流
-                        _recognizerStream.Dispose();
-                        _recognizerStream = null;
-                        _logger.LogDebug("识别器流已释放");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, $"释放识别器流时发生错误: {ex.Message}");
-                    }
+                    _logger.LogWarning("语音录制已经处于停止状态");
+                    return;
                 }
 
-                // 清理音频资源
-                Cleanup();
+                try
+                {
+                    _logger.LogInformation("停止sherpa-onnx语音录制");
 
-                // 清除文本内容，确保下次录音不会保留之前的内容
-                _lastText = string.Empty;
-                _currentText = string.Empty;
+                    // 先设置录音状态为false，确保回调函数不再处理新的音频数据
+                    _isRecording = false;
 
-                OnRecordingStopped?.Invoke();
+                    // 取消正在进行的任务
+                    _cts?.Cancel();
 
-                _logger.LogInformation("sherpa-onnx语音录制已停止");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"停止sherpa-onnx语音录制时发生错误: {ex.Message}");
-                _isRecording = false;
-                OnRecordingStopped?.Invoke();
+                    // 停止音频流，确保不再有回调发生
+                    if (_audioStream != null && !_audioStream.IsStopped)
+                    {
+                        try
+                        {
+                            _audioStream.Stop();
+                            _logger.LogDebug("音频流已停止");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"停止音频流时发生错误: {ex.Message}");
+                        }
+                    }
 
-                // 即使发生错误也清除文本内容
-                _lastText = string.Empty;
-                _currentText = string.Empty;
+                    // 等待一小段时间确保所有回调都已完成
+                    Thread.Sleep(100);
+
+                    // 重置识别器流，确保停止处理之前的音频数据
+                    if (_recognizer != null && _recognizerStream != null)
+                    {
+                        try
+                        {
+                            // 释放旧的识别器流
+                            _recognizerStream.Dispose();
+                            _recognizerStream = null;
+                            _logger.LogDebug("识别器流已释放");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"释放识别器流时发生错误: {ex.Message}");
+                        }
+                    }
+
+                    // 清理音频资源
+                    Cleanup();
+
+                    // 清除文本内容，确保下次录音不会保留之前的内容
+                    _lastText = string.Empty;
+                    _currentText = string.Empty;
+
+                    OnRecordingStopped?.Invoke();
+
+                    _logger.LogInformation("sherpa-onnx语音录制已停止");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"停止sherpa-onnx语音录制时发生错误: {ex.Message}");
+                    _isRecording = false;
+                    OnRecordingStopped?.Invoke();
+
+                    // 即使发生错误也清除文本内容
+                    _lastText = string.Empty;
+                    _currentText = string.Empty;
+                }
             }
         }
 
@@ -470,9 +537,6 @@ namespace SmartSpeaker.Core.Services
                             _logger.LogDebug("音频流已经处于停止状态，无需再次停止");
                         }
 
-                        // 不释放音频流资源，保持单例状态
-                        // _audioStream.Dispose();
-                        // _audioStream = null;
                     }
                     catch (Exception ex)
                     {
@@ -487,18 +551,6 @@ namespace SmartSpeaker.Core.Services
                     _cts = null;
                 }
 
-                // 不释放sherpa-onnx资源，保持单例状态
-                // if (_recognizerStream != null)
-                // {
-                //     _recognizerStream.Dispose();
-                //     _recognizerStream = null;
-                // }
-
-                // if (_recognizer != null)
-                // {
-                //     _recognizer.Dispose();
-                //     _recognizer = null;
-                // }
             }
             catch (Exception ex)
             {
