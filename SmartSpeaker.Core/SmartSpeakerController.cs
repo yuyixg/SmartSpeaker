@@ -265,6 +265,7 @@ namespace SmartSpeaker.Core
             {
                 _logger.LogInformation("语音识别结果为空，退出对话");
                 await _speechPlayer.SpeakTextAsync("抱歉，我没听到您的问题，再见。");
+                TransitionToState(SmartSpeakerState.Idle);
                 return;
             }
             
